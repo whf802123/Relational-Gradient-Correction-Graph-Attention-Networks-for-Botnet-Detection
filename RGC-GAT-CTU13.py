@@ -58,6 +58,8 @@ IRGD_ON_FIRST_WINDOW = False
 IRGD_REL_WEIGHT = 1.0
 IRGD_EPS = 1e-12
 IRGD_GRAD_CLIP = None
+IRGD_HVP_ENABLED = True
+IRGD_HVP_STEP = LR
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.manual_seed(SEED)
@@ -276,8 +278,14 @@ global_idx = 0
 stream_window_id = 0
 
 irgd_steps = 0
+irgd_first_order_conflicts = 0
+irgd_hvp_checks = 0
+irgd_hvp_harmful = 0
 irgd_conflicts = 0
 irgd_cosines = []
+irgd_predicted_harms = []
+irgd_cross_curvatures = []
+irgd_rel_curvatures = []
 
 
 def select_training_indices(
@@ -331,6 +339,65 @@ def _materialize_grads(grads, params):
     return out
 
 
+def _compute_encoder_hvp(
+        params,
+        encoder_param_ids,
+        grads_self_raw,
+        rel_grads_detached,
+):
+    seed_terms = []
+
+    for p, gs_raw, gr_det in zip(
+            params,
+            grads_self_raw,
+            rel_grads_detached,
+    ):
+        if id(p) not in encoder_param_ids:
+            continue
+        if gs_raw is None:
+            continue
+        if not gs_raw.requires_grad:
+            continue
+        seed_terms.append(torch.sum(gs_raw * gr_det))
+
+    encoder_params = [
+        p for p in params
+        if id(p) in encoder_param_ids
+    ]
+
+    if len(seed_terms) == 0:
+        return {
+            id(p): torch.zeros_like(p)
+            for p in encoder_params
+        }
+
+    hvp_seed = torch.stack(seed_terms).sum()
+
+    try:
+        hvp_raw = torch.autograd.grad(
+            hvp_seed,
+            encoder_params,
+            retain_graph=False,
+            create_graph=False,
+            allow_unused=True,
+        )
+    except RuntimeError as e:
+        raise RuntimeError(
+            "HVP computation failed. Check whether the installed "
+            "PyTorch/PyG version supports the required double backward."
+        ) from e
+
+    hvp_map = {}
+    for p, hv in zip(encoder_params, hvp_raw):
+        hvp_map[id(p)] = (
+            torch.zeros_like(p)
+            if hv is None
+            else hv.detach()
+        )
+
+    return hvp_map
+
+
 def apply_irgd_step(
         model,
         optimizer,
@@ -342,7 +409,8 @@ def apply_irgd_step(
 ):
     params = [p for p in model.parameters() if p.requires_grad]
     encoder_param_ids = {
-        id(p) for p in list(model.gat1.parameters()) + list(model.gcn2.parameters())
+        id(p)
+        for p in list(model.gat1.parameters()) + list(model.gcn2.parameters())
     }
 
     logits_full, _ = model(x_train_tensor, train_edge_index)
@@ -352,7 +420,9 @@ def apply_irgd_step(
 
     ei_full, att_full = model.cached_att
     nodes_mask = torch.zeros(
-        x_train_tensor.size(0), dtype=torch.bool, device=DEVICE
+        x_train_tensor.size(0),
+        dtype=torch.bool,
+        device=DEVICE,
     )
     nodes_mask[used_idx] = True
 
@@ -372,63 +442,189 @@ def apply_irgd_step(
         create_graph=False,
         allow_unused=True,
     )
-    grads_graph = _materialize_grads(grads_graph_raw, params)
+    grads_graph = _materialize_grads(
+        grads_graph_raw,
+        params,
+    )
 
-    logits_self, _ = model(x_train_tensor, self_edge_index)
-    ce_self = _loss_on_used_nodes(logits_self, y_train_tensor, used_idx)
+    logits_self, _ = model(
+        x_train_tensor,
+        self_edge_index,
+    )
+    ce_self = _loss_on_used_nodes(
+        logits_self,
+        y_train_tensor,
+        used_idx,
+    )
 
     grads_self_raw = torch.autograd.grad(
         ce_self,
         params,
-        retain_graph=False,
-        create_graph=False,
+        retain_graph=IRGD_HVP_ENABLED,
+        create_graph=IRGD_HVP_ENABLED,
         allow_unused=True,
     )
-    grads_self = _materialize_grads(grads_self_raw, params)
+    grads_self = _materialize_grads(
+        grads_self_raw,
+        params,
+    )
 
     dot = torch.zeros((), device=DEVICE)
     self_norm_sq = torch.zeros((), device=DEVICE)
     rel_norm_sq = torch.zeros((), device=DEVICE)
 
-    rel_grads = []
-    for p, gg, gs in zip(params, grads_graph, grads_self):
-        gr = gg - gs
-        rel_grads.append(gr)
+    rel_grads_detached = []
+
+    for p, gg, gs in zip(
+            params,
+            grads_graph,
+            grads_self,
+    ):
+        gr_det = gg.detach() - gs.detach()
+        rel_grads_detached.append(gr_det)
+
         if id(p) in encoder_param_ids:
-            dot = dot + torch.sum(gs * gr)
-            self_norm_sq = self_norm_sq + torch.sum(gs * gs)
-            rel_norm_sq = rel_norm_sq + torch.sum(gr * gr)
+            gs_det = gs.detach()
+            dot = dot + torch.sum(gs_det * gr_det)
+            self_norm_sq = (
+                self_norm_sq
+                + torch.sum(gs_det * gs_det)
+            )
+            rel_norm_sq = (
+                rel_norm_sq
+                + torch.sum(gr_det * gr_det)
+            )
 
-    conflict = bool(dot.detach().item() < 0.0)
-
-    denom = torch.sqrt(self_norm_sq.clamp_min(IRGD_EPS)) * torch.sqrt(
-        rel_norm_sq.clamp_min(IRGD_EPS)
+    first_order_conflict = bool(
+        dot.detach().item() < 0.0
     )
-    cosine = (dot / denom.clamp_min(IRGD_EPS)).detach().item()
+
+    denom = (
+        torch.sqrt(self_norm_sq.clamp_min(IRGD_EPS))
+        * torch.sqrt(rel_norm_sq.clamp_min(IRGD_EPS))
+    )
+    cosine = (
+        dot / denom.clamp_min(IRGD_EPS)
+    ).detach().item()
+
+    hvp_checked = False
+    hvp_harmful = False
+    predicted_harm = np.nan
+    cross_curvature = np.nan
+    rel_curvature = np.nan
+
+    if IRGD_HVP_ENABLED and first_order_conflict:
+        hvp_checked = True
+
+        hvp_map = _compute_encoder_hvp(
+            params=params,
+            encoder_param_ids=encoder_param_ids,
+            grads_self_raw=grads_self_raw,
+            rel_grads_detached=rel_grads_detached,
+        )
+
+        cross_curvature_tensor = torch.zeros(
+            (),
+            device=DEVICE,
+        )
+        rel_curvature_tensor = torch.zeros(
+            (),
+            device=DEVICE,
+        )
+
+        for p, gs, gr_det in zip(
+                params,
+                grads_self,
+                rel_grads_detached,
+        ):
+            if id(p) not in encoder_param_ids:
+                continue
+
+            hgr = hvp_map[id(p)]
+            gs_det = gs.detach()
+
+            cross_curvature_tensor = (
+                cross_curvature_tensor
+                + torch.sum(gs_det * hgr)
+            )
+            rel_curvature_tensor = (
+                rel_curvature_tensor
+                + torch.sum(gr_det * hgr)
+            )
+
+        eta = float(IRGD_HVP_STEP)
+
+        predicted_harm_tensor = (
+            -eta * dot
+            + (eta ** 2) * cross_curvature_tensor
+            + 0.5 * (eta ** 2) * rel_curvature_tensor
+        )
+
+        cross_curvature = float(
+            cross_curvature_tensor.detach().cpu()
+        )
+        rel_curvature = float(
+            rel_curvature_tensor.detach().cpu()
+        )
+        predicted_harm = float(
+            predicted_harm_tensor.detach().cpu()
+        )
+        hvp_harmful = bool(
+            predicted_harm > 0.0
+        )
+
+    if IRGD_HVP_ENABLED:
+        conflict = (
+            first_order_conflict
+            and hvp_harmful
+        )
+    else:
+        conflict = first_order_conflict
 
     if conflict:
-
-        coeff = dot / self_norm_sq.clamp_min(IRGD_EPS)
+        coeff = (
+            dot
+            / self_norm_sq.clamp_min(IRGD_EPS)
+        )
     else:
-        coeff = torch.zeros((), device=DEVICE)
+        coeff = torch.zeros(
+            (),
+            device=DEVICE,
+        )
 
     optimizer.zero_grad(set_to_none=True)
 
-    for p, gg, gs, gr in zip(params, grads_graph, grads_self, rel_grads):
+    for p, gg, gs, gr_det in zip(
+            params,
+            grads_graph,
+            grads_self,
+            rel_grads_detached,
+    ):
         if id(p) in encoder_param_ids:
-            if conflict:
-                gr_safe = gr - coeff * gs
-            else:
-                gr_safe = gr
-            final_grad = gs + IRGD_REL_WEIGHT * gr_safe
-        else:
+            gs_det = gs.detach()
 
-            final_grad = gg
+            if conflict:
+                gr_safe = (
+                    gr_det
+                    - coeff * gs_det
+                )
+            else:
+                gr_safe = gr_det
+
+            final_grad = (
+                gs_det
+                + IRGD_REL_WEIGHT * gr_safe
+            )
+        else:
+            final_grad = gg.detach()
 
         p.grad = final_grad.detach()
 
     if IRGD_GRAD_CLIP is not None:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), IRGD_GRAD_CLIP)
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            IRGD_GRAD_CLIP,
+        )
 
     optimizer.step()
 
@@ -436,11 +632,16 @@ def apply_irgd_step(
         'loss_full': float(loss_full.detach().cpu()),
         'ce_full': float(ce_full.detach().cpu()),
         'ce_self': float(ce_self.detach().cpu()),
+        'first_order_conflict': first_order_conflict,
+        'hvp_checked': hvp_checked,
+        'hvp_harmful': hvp_harmful,
         'conflict': conflict,
         'dot': float(dot.detach().cpu()),
         'cosine': float(cosine),
+        'cross_curvature': cross_curvature,
+        'rel_curvature': rel_curvature,
+        'predicted_harm': predicted_harm,
     }
-
 
 def attention_heads_node_mean_from_cached_incoming(
         ei_used,
@@ -535,8 +736,12 @@ for start in tqdm(range(0, N, BATCH_SIZE), desc='Processing batches'):
     first_window = (model is None)
 
     window_irgd_steps = 0
+    window_first_order_conflicts = 0
+    window_hvp_checks = 0
+    window_hvp_harmful = 0
     window_irgd_conflicts = 0
     window_irgd_cosines = []
+    window_predicted_harms = []
 
     x_win_np = np.asarray(features_window, dtype=np.float64)
     y_win_np = np.asarray(labels_window, dtype=np.int64)
@@ -624,12 +829,28 @@ for start in tqdm(range(0, N, BATCH_SIZE), desc='Processing batches'):
             )
             if stats is not None:
                 irgd_steps += 1
+                irgd_first_order_conflicts += int(stats['first_order_conflict'])
+                irgd_hvp_checks += int(stats['hvp_checked'])
+                irgd_hvp_harmful += int(stats['hvp_harmful'])
                 irgd_conflicts += int(stats['conflict'])
                 irgd_cosines.append(stats['cosine'])
 
+                if np.isfinite(stats['predicted_harm']):
+                    irgd_predicted_harms.append(stats['predicted_harm'])
+                if np.isfinite(stats['cross_curvature']):
+                    irgd_cross_curvatures.append(stats['cross_curvature'])
+                if np.isfinite(stats['rel_curvature']):
+                    irgd_rel_curvatures.append(stats['rel_curvature'])
+
                 window_irgd_steps += 1
+                window_first_order_conflicts += int(stats['first_order_conflict'])
+                window_hvp_checks += int(stats['hvp_checked'])
+                window_hvp_harmful += int(stats['hvp_harmful'])
                 window_irgd_conflicts += int(stats['conflict'])
                 window_irgd_cosines.append(stats['cosine'])
+
+                if np.isfinite(stats['predicted_harm']):
+                    window_predicted_harms.append(stats['predicted_harm'])
         else:
 
             logits_train, _hidden_train = model(x_train_tensor, train_edge_index)
@@ -769,34 +990,151 @@ for start in tqdm(range(0, N, BATCH_SIZE), desc='Processing batches'):
 
     if ENABLE_WINDOW_ANALYSIS:
         if window_irgd_steps > 0:
-            conflict_ratio = window_irgd_conflicts / window_irgd_steps
-            mean_window_cos = float(np.mean(window_irgd_cosines))
+            first_order_ratio = (
+                window_first_order_conflicts
+                / window_irgd_steps
+            )
+            conflict_ratio = (
+                window_irgd_conflicts
+                / window_irgd_steps
+            )
+            mean_window_cos = float(
+                np.mean(window_irgd_cosines)
+            )
         else:
+            first_order_ratio = np.nan
             conflict_ratio = np.nan
             mean_window_cos = np.nan
+
+        if len(window_predicted_harms) > 0:
+            mean_predicted_harm = float(
+                np.mean(window_predicted_harms)
+            )
+        else:
+            mean_predicted_harm = np.nan
 
         window_conflict_stats.append({
             'window': stream_window_id,
             'stream_start': int(idx_win_np[0]),
             'stream_end': int(idx_win_np[-1]),
             'rgc_updates': int(window_irgd_steps),
-            'conflict_updates': int(window_irgd_conflicts),
-            'conflict_ratio': float(conflict_ratio) if np.isfinite(conflict_ratio) else np.nan,
-            'mean_cosine': float(mean_window_cos) if np.isfinite(mean_window_cos) else np.nan,
+            'first_order_conflict_updates': int(
+                window_first_order_conflicts
+            ),
+            'hvp_checks': int(window_hvp_checks),
+            'hvp_harmful_updates': int(
+                window_hvp_harmful
+            ),
+            'conflict_updates': int(
+                window_irgd_conflicts
+            ),
+            'first_order_conflict_ratio': (
+                float(first_order_ratio)
+                if np.isfinite(first_order_ratio)
+                else np.nan
+            ),
+            'conflict_ratio': (
+                float(conflict_ratio)
+                if np.isfinite(conflict_ratio)
+                else np.nan
+            ),
+            'mean_cosine': (
+                float(mean_window_cos)
+                if np.isfinite(mean_window_cos)
+                else np.nan
+            ),
+            'mean_predicted_harm': (
+                float(mean_predicted_harm)
+                if np.isfinite(mean_predicted_harm)
+                else np.nan
+            ),
         })
 
     stream_window_id += 1
     model.cached_att = None
 
 if IRGD_ENABLED:
-    print("\n=== IRGD Training Diagnostics ===")
-    print(f"IRGD update steps: {irgd_steps}")
+    print("\n=== RGC + HVP Training Diagnostics ===")
+    print(f"RGC update steps: {irgd_steps}")
     if irgd_steps > 0:
-        conflict_rate = 100.0 * irgd_conflicts / irgd_steps
-        mean_cos = float(np.mean(irgd_cosines)) if irgd_cosines else 0.0
-        print(f"Conflict steps: {irgd_conflicts} ({conflict_rate:.2f}%)")
-        print(f"Mean cosine(g_self, g_rel): {mean_cos:.4f}")
-        print("No-conflict steps are mathematically identical to baseline full-graph updates when IRGD_REL_WEIGHT=1.0.")
+        first_order_rate = (
+            100.0
+            * irgd_first_order_conflicts
+            / irgd_steps
+        )
+        conflict_rate = (
+            100.0
+            * irgd_conflicts
+            / irgd_steps
+        )
+        mean_cos = (
+            float(np.mean(irgd_cosines))
+            if irgd_cosines
+            else 0.0
+        )
+
+        print(
+            f"First-order candidate conflicts: "
+            f"{irgd_first_order_conflicts} "
+            f"({first_order_rate:.2f}%)"
+        )
+
+        if IRGD_HVP_ENABLED:
+            print(f"HVP checks: {irgd_hvp_checks}")
+            print(
+                f"HVP-confirmed harmful candidates: "
+                f"{irgd_hvp_harmful}"
+            )
+            print(
+                f"Final corrected steps: "
+                f"{irgd_conflicts} "
+                f"({conflict_rate:.2f}%)"
+            )
+
+            if irgd_hvp_checks > 0:
+                filtered = (
+                    irgd_hvp_checks
+                    - irgd_hvp_harmful
+                )
+                filtered_pct = (
+                    100.0
+                    * filtered
+                    / irgd_hvp_checks
+                )
+                print(
+                    f"First-order candidates rejected by HVP: "
+                    f"{filtered} "
+                    f"({filtered_pct:.2f}%)"
+                )
+
+            if irgd_predicted_harms:
+                print(
+                    "Mean second-order predicted relational harm: "
+                    f"{np.mean(irgd_predicted_harms):.6e}"
+                )
+
+            if irgd_cross_curvatures:
+                print(
+                    "Mean g_self^T H_self g_rel: "
+                    f"{np.mean(irgd_cross_curvatures):.6e}"
+                )
+
+            if irgd_rel_curvatures:
+                print(
+                    "Mean g_rel^T H_self g_rel: "
+                    f"{np.mean(irgd_rel_curvatures):.6e}"
+                )
+        else:
+            print(
+                f"Final corrected steps: "
+                f"{irgd_conflicts} "
+                f"({conflict_rate:.2f}%)"
+            )
+
+        print(
+            f"Mean cosine(g_self, g_rel): "
+            f"{mean_cos:.4f}"
+        )
 
 y_true_test = np.asarray(y_true_test, dtype=np.int64)
 y_pred_test = np.asarray(y_pred_test, dtype=np.int64)
@@ -968,23 +1306,79 @@ if ENABLE_WINDOW_ANALYSIS:
             .reset_index(drop=True)
         )
 
-        print("\n=== Window-level RGC Conflict Diagnostics ===")
+        print("\n=== Window-level RGC + HVP Diagnostics ===")
         print(f"Total full windows: {len(conflict_df)}")
         print(f"Windows with RGC updates: {len(valid_conflict_df)}")
 
         if len(valid_conflict_df) > 0:
-            total_updates = int(valid_conflict_df['rgc_updates'].sum())
-            total_conflicts = int(valid_conflict_df['conflict_updates'].sum())
+            total_updates = int(
+                valid_conflict_df['rgc_updates'].sum()
+            )
+            total_candidates = int(
+                valid_conflict_df[
+                    'first_order_conflict_updates'
+                ].sum()
+            )
+            total_hvp_checks = int(
+                valid_conflict_df['hvp_checks'].sum()
+            )
+            total_hvp_harmful = int(
+                valid_conflict_df[
+                    'hvp_harmful_updates'
+                ].sum()
+            )
+            total_conflicts = int(
+                valid_conflict_df[
+                    'conflict_updates'
+                ].sum()
+            )
+
+            overall_first_order_ratio = (
+                total_candidates / total_updates
+                if total_updates > 0
+                else 0.0
+            )
             overall_conflict_ratio = (
-                total_conflicts / total_updates if total_updates > 0 else 0.0
+                total_conflicts / total_updates
+                if total_updates > 0
+                else 0.0
             )
 
-            print(f"RGC update steps in plotted windows: {total_updates}")
-            print(f"Conflict update steps: {total_conflicts}")
-            print(f"Overall conflict ratio: {overall_conflict_ratio * 100:.2f}%")
+            print(
+                f"RGC update steps in plotted windows: "
+                f"{total_updates}"
+            )
+            print(
+                f"First-order candidate conflicts: "
+                f"{total_candidates}"
+            )
+            print(
+                f"HVP checks: "
+                f"{total_hvp_checks}"
+            )
+            print(
+                f"HVP-confirmed harmful candidates: "
+                f"{total_hvp_harmful}"
+            )
+            print(
+                f"Final corrected steps: "
+                f"{total_conflicts}"
+            )
+            print(
+                f"Overall first-order candidate ratio: "
+                f"{overall_first_order_ratio * 100:.2f}%"
+            )
+            print(
+                f"Overall HVP-confirmed ratio: "
+                f"{overall_conflict_ratio * 100:.2f}%"
+            )
 
-            valid_conflict_df['rolling_conflicts'] = (
-                valid_conflict_df['conflict_updates']
+            valid_conflict_df[
+                'rolling_candidate_conflicts'
+            ] = (
+                valid_conflict_df[
+                    'first_order_conflict_updates'
+                ]
                 .rolling(
                     window=RGC_ROLLING_WINDOWS,
                     min_periods=1,
@@ -992,8 +1386,12 @@ if ENABLE_WINDOW_ANALYSIS:
                 .sum()
             )
 
-            valid_conflict_df['rolling_updates'] = (
-                valid_conflict_df['rgc_updates']
+            valid_conflict_df[
+                'rolling_confirmed_conflicts'
+            ] = (
+                valid_conflict_df[
+                    'conflict_updates'
+                ]
                 .rolling(
                     window=RGC_ROLLING_WINDOWS,
                     min_periods=1,
@@ -1001,35 +1399,101 @@ if ENABLE_WINDOW_ANALYSIS:
                 .sum()
             )
 
-            valid_conflict_df['rolling_conflict_ratio'] = (
-                valid_conflict_df['rolling_conflicts']
-                / valid_conflict_df['rolling_updates'].clip(lower=1)
+            valid_conflict_df[
+                'rolling_updates'
+            ] = (
+                valid_conflict_df[
+                    'rgc_updates'
+                ]
+                .rolling(
+                    window=RGC_ROLLING_WINDOWS,
+                    min_periods=1,
+                )
+                .sum()
             )
 
-            fig_cr, ax_cr = plt.subplots(figsize=(7.2, 4.6))
+            valid_conflict_df[
+                'rolling_first_order_ratio'
+            ] = (
+                valid_conflict_df[
+                    'rolling_candidate_conflicts'
+                ]
+                / valid_conflict_df[
+                    'rolling_updates'
+                ].clip(lower=1)
+            )
+
+            valid_conflict_df[
+                'rolling_conflict_ratio'
+            ] = (
+                valid_conflict_df[
+                    'rolling_confirmed_conflicts'
+                ]
+                / valid_conflict_df[
+                    'rolling_updates'
+                ].clip(lower=1)
+            )
+
+            fig_cr, ax_cr = plt.subplots(
+                figsize=(7.2, 4.6)
+            )
+
             ax_cr.plot(
                 valid_conflict_df['window'],
-                valid_conflict_df['rolling_conflict_ratio'] * 100.0,
-                linewidth=1.7,
-                label=f'{RGC_ROLLING_WINDOWS}-Window Rolling Ratio',
+                valid_conflict_df[
+                    'rolling_first_order_ratio'
+                ] * 100.0,
+                linewidth=1.4,
+                label=(
+                    f'{RGC_ROLLING_WINDOWS}-Window '
+                    f'First-order Ratio'
+                ),
             )
+
+            ax_cr.plot(
+                valid_conflict_df['window'],
+                valid_conflict_df[
+                    'rolling_conflict_ratio'
+                ] * 100.0,
+                linewidth=1.7,
+                label=(
+                    f'{RGC_ROLLING_WINDOWS}-Window '
+                    f'HVP-confirmed Ratio'
+                ),
+            )
+
+            ax_cr.axhline(
+                overall_first_order_ratio * 100.0,
+                linestyle=':',
+                linewidth=1.0,
+                label='Overall First-order Ratio',
+            )
+
             ax_cr.axhline(
                 overall_conflict_ratio * 100.0,
                 linestyle='--',
                 linewidth=1.2,
-                label='Overall Ratio',
+                label='Overall HVP-confirmed Ratio',
             )
+
             ax_cr.set_xlabel('Window Index')
             ax_cr.set_ylabel('RGC Conflict Ratio (%)')
-            ax_cr.set_title('RGC Gradient Conflict Ratio over Streaming Windows')
+            ax_cr.set_title(
+                'First-order Candidates vs '
+                'HVP-confirmed Harm'
+            )
             ax_cr.set_ylim(0.0, 101.0)
             ax_cr.grid(True, alpha=0.3)
             ax_cr.legend()
+
             fig_cr.tight_layout()
             plt.show()
             plt.close(fig_cr)
         else:
-            print("[RGC Conflict] No RGC-enabled window was recorded.")
+            print(
+                "[RGC Conflict] "
+                "No RGC-enabled window was recorded."
+            )
 
 TSNE_MAX_PER_CLASS = 1000
 
@@ -1129,3 +1593,4 @@ try:
         print("t-SNE: Too few test embeddings. Skipping visualization.")
 except Exception as e:
     print("t-SNE visualization failed:", e)
+
