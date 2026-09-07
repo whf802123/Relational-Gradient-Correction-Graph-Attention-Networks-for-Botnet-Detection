@@ -1,3 +1,4 @@
+
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -60,6 +61,9 @@ IRGD_REL_WEIGHT       = 1.0
 IRGD_EPS              = 1e-12
 IRGD_GRAD_CLIP        = None
 
+IRGD_HVP_ENABLED      = True
+IRGD_HVP_STEP         = LR
+
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.manual_seed(SEED)
 np.random.seed(SEED)
@@ -97,10 +101,8 @@ def to_float(val):
 
 df = pd.read_csv(CSV_PATH)
 
-
 if is_unnamed(df.columns[0]):
     df.drop(df.columns[0], axis=1, inplace=True)
-
 
 df.insert(0, 'num', range(len(df)))
 
@@ -116,7 +118,6 @@ before = len(df)
 df = df[~df['label'].isin(rare_labels_to_drop)].reset_index(drop=True)
 after = len(df)
 print(f"Dropped rare classes {sorted(list(rare_labels_to_drop))}. Rows: {before} -> {after}")
-
 
 print(f"Minority (kept intact): {sorted(MANUAL_MINORITY_LABELS)}")
 print(f"Sampling {SAMPLE_FRAC * 100:.1f}% for ALL other classes ...")
@@ -240,7 +241,6 @@ NUM_CLASSES = len(train_unique_ids)
 if NUM_CLASSES != len(np.unique(labels)):
     raise RuntimeError("The training set does not contain all classes required for the current multiclass setting.")
 
-
 def _safe_row_corrcoef(x_np: np.ndarray) -> np.ndarray:
     if x_np.shape[0] == 0:
         return np.empty((0, 0), dtype=np.float64)
@@ -261,7 +261,6 @@ def build_train_graph(x_train_np: np.ndarray):
     np.fill_diagonal(adj, False)
 
     src, dst = np.where(adj)
-
 
     self_nodes = np.arange(n, dtype=np.int64)
     src = np.concatenate([src.astype(np.int64), self_nodes])
@@ -289,7 +288,6 @@ def build_inductive_eval_graph(x_train_np: np.ndarray, x_test_np: np.ndarray):
     src_list = []
     dst_list = []
 
-
     if n_train > 0:
         corr_tt = corr[:n_train, :n_train]
         adj_tt = (np.abs(corr_tt) >= CORR_THRESHOLD)
@@ -298,13 +296,11 @@ def build_inductive_eval_graph(x_train_np: np.ndarray, x_test_np: np.ndarray):
         src_list.append(src_tt.astype(np.int64))
         dst_list.append(dst_tt.astype(np.int64))
 
-
         corr_train_test = corr[:n_train, n_train:]
         train_src, test_col = np.where(np.abs(corr_train_test) >= CORR_THRESHOLD)
         if train_src.size > 0:
             src_list.append(train_src.astype(np.int64))
             dst_list.append((n_train + test_col).astype(np.int64))
-
 
     self_nodes = np.arange(n_total, dtype=np.int64)
     src_list.append(self_nodes)
@@ -347,7 +343,6 @@ class WeightedGATClassifier(nn.Module):
         )
         x1 = F.elu(x1)
 
-
         edge_weight = att_heads.mean(dim=1)
         self.cached_att = (ei_used, att_heads)
 
@@ -364,7 +359,6 @@ model = None
 optimizer = None
 criterion = None
 
-
 if NUM_CLASSES == 2:
     train_labels_only = labels[train_idx]
     pos_ratio = (train_labels_only == 1).mean() + 1e-8
@@ -373,29 +367,33 @@ if NUM_CLASSES == 2:
 else:
     w_neg = w_pos = 1.0
 
-
 y_true_test = []
 y_pred_test = []
 y_prob_test_all = []
 hidden_test = []
 
 window_metrics = []
-window_conflict_stats = []
 
+window_conflict_stats = []
 
 global_idx = 0
 stream_window_id = 0
 
 
 irgd_steps = 0
+irgd_first_order_conflicts = 0
+irgd_hvp_checks = 0
+irgd_hvp_harmful = 0
 irgd_conflicts = 0
 irgd_cosines = []
-
+irgd_predicted_harms = []
+irgd_cross_curvatures = []
+irgd_rel_curvatures = []
 
 def select_training_indices(
-    n_nodes,
-    new_train_mask_local,
-    first_window=False,
+        n_nodes,
+        new_train_mask_local,
+        first_window=False,
 ):
     if n_nodes == 0:
         return None
@@ -442,6 +440,51 @@ def _materialize_grads(grads, params):
         out.append(_zeros_like_param(p) if g is None else g)
     return out
 
+def _compute_encoder_hvp(
+    params,
+    encoder_param_ids,
+    grads_self_raw,
+    rel_grads_detached,
+):
+    """Compute H_self @ g_rel for encoder parameters without forming H_self."""
+    seed_terms = []
+
+    for p, gs_raw, gr_det in zip(params, grads_self_raw, rel_grads_detached):
+        if id(p) not in encoder_param_ids:
+            continue
+        if gs_raw is None or not gs_raw.requires_grad:
+            continue
+
+        # d/dtheta [g_self(theta)^T stopgrad(g_rel)] = H_self g_rel
+        seed_terms.append(torch.sum(gs_raw * gr_det))
+
+    encoder_params = [p for p in params if id(p) in encoder_param_ids]
+
+    if len(seed_terms) == 0:
+        return {id(p): torch.zeros_like(p) for p in encoder_params}
+
+    hvp_seed = torch.stack(seed_terms).sum()
+
+    try:
+        hvp_raw = torch.autograd.grad(
+            hvp_seed,
+            encoder_params,
+            retain_graph=False,
+            create_graph=False,
+            allow_unused=True,
+        )
+    except RuntimeError as e:
+        raise RuntimeError(
+            "Second-order HVP computation failed. Your installed PyTorch/PyG "
+            "version may contain an operation without double-backward support."
+        ) from e
+
+    hvp_map = {}
+    for p, hv in zip(encoder_params, hvp_raw):
+        hvp_map[id(p)] = torch.zeros_like(p) if hv is None else hv.detach()
+
+    return hvp_map
+
 
 def apply_irgd_step(
     model,
@@ -452,12 +495,33 @@ def apply_irgd_step(
     self_edge_index,
     used_idx,
 ):
+    """
+    Two-stage RGC:
+
+    1) First-order candidate conflict:
+         g_rel = g_graph - g_self
+         g_self^T g_rel < 0
+
+    2) HVP harm verification using the self-only CE Hessian:
+
+         Delta_rel^(2)
+           = -eta g_self^T g_rel
+             + eta^2 g_self^T H_self g_rel
+             + 0.5 eta^2 g_rel^T H_self g_rel
+
+       RGC correction is applied only when the first-order candidate exists
+       and Delta_rel^(2) > 0.
+
+    IRGD_HVP_STEP is a local SGD-style Taylor probe scale. The actual
+    optimizer is Adam, so Delta_rel^(2) is a local harm estimate rather than
+    an exact Adam loss prediction.
+    """
     params = [p for p in model.parameters() if p.requires_grad]
     encoder_param_ids = {
         id(p) for p in list(model.gat1.parameters()) + list(model.gcn2.parameters())
     }
 
-
+    # Full-graph gradient.
     logits_full, _ = model(x_train_tensor, train_edge_index)
     ce_full = _loss_on_used_nodes(logits_full, y_train_tensor, used_idx)
     if ce_full is None:
@@ -487,61 +551,114 @@ def apply_irgd_step(
     )
     grads_graph = _materialize_grads(grads_graph_raw, params)
 
-
+    # Self-only intrinsic gradient. create_graph=True is required for HVP.
     logits_self, _ = model(x_train_tensor, self_edge_index)
     ce_self = _loss_on_used_nodes(logits_self, y_train_tensor, used_idx)
-
 
     grads_self_raw = torch.autograd.grad(
         ce_self,
         params,
-        retain_graph=False,
-        create_graph=False,
+        retain_graph=IRGD_HVP_ENABLED,
+        create_graph=IRGD_HVP_ENABLED,
         allow_unused=True,
     )
     grads_self = _materialize_grads(grads_self_raw, params)
-
 
     dot = torch.zeros((), device=DEVICE)
     self_norm_sq = torch.zeros((), device=DEVICE)
     rel_norm_sq = torch.zeros((), device=DEVICE)
 
-    rel_grads = []
+    rel_grads_detached = []
     for p, gg, gs in zip(params, grads_graph, grads_self):
-        gr = gg - gs
-        rel_grads.append(gr)
+        # g_rel is treated as a fixed numerical direction for HVP.
+        gr_det = gg.detach() - gs.detach()
+        rel_grads_detached.append(gr_det)
+
         if id(p) in encoder_param_ids:
-            dot = dot + torch.sum(gs * gr)
-            self_norm_sq = self_norm_sq + torch.sum(gs * gs)
-            rel_norm_sq = rel_norm_sq + torch.sum(gr * gr)
+            gs_det = gs.detach()
+            dot = dot + torch.sum(gs_det * gr_det)
+            self_norm_sq = self_norm_sq + torch.sum(gs_det * gs_det)
+            rel_norm_sq = rel_norm_sq + torch.sum(gr_det * gr_det)
 
-    conflict = bool(dot.detach().item() < 0.0)
-
+    first_order_conflict = bool(dot.item() < 0.0)
 
     denom = torch.sqrt(self_norm_sq.clamp_min(IRGD_EPS)) * torch.sqrt(
         rel_norm_sq.clamp_min(IRGD_EPS)
     )
-    cosine = (dot / denom.clamp_min(IRGD_EPS)).detach().item()
+    cosine = (dot / denom.clamp_min(IRGD_EPS)).item()
+
+    hvp_checked = False
+    hvp_harmful = False
+    predicted_harm = np.nan
+    cross_curvature = np.nan
+    rel_curvature = np.nan
+
+    # HVP is only evaluated for first-order candidates.
+    if IRGD_HVP_ENABLED and first_order_conflict:
+        hvp_checked = True
+
+        hvp_map = _compute_encoder_hvp(
+            params=params,
+            encoder_param_ids=encoder_param_ids,
+            grads_self_raw=grads_self_raw,
+            rel_grads_detached=rel_grads_detached,
+        )
+
+        cross_curv_tensor = torch.zeros((), device=DEVICE)
+        rel_curv_tensor = torch.zeros((), device=DEVICE)
+
+        for p, gs, gr_det in zip(params, grads_self, rel_grads_detached):
+            if id(p) not in encoder_param_ids:
+                continue
+
+            hgr = hvp_map[id(p)]
+            gs_det = gs.detach()
+
+            # g_self^T H_self g_rel
+            cross_curv_tensor = cross_curv_tensor + torch.sum(gs_det * hgr)
+
+            # g_rel^T H_self g_rel
+            rel_curv_tensor = rel_curv_tensor + torch.sum(gr_det * hgr)
+
+        eta = float(IRGD_HVP_STEP)
+        predicted_harm_tensor = (
+            -eta * dot
+            + (eta ** 2) * cross_curv_tensor
+            + 0.5 * (eta ** 2) * rel_curv_tensor
+        )
+
+        cross_curvature = float(cross_curv_tensor.detach().cpu())
+        rel_curvature = float(rel_curv_tensor.detach().cpu())
+        predicted_harm = float(predicted_harm_tensor.detach().cpu())
+        hvp_harmful = bool(predicted_harm > 0.0)
+
+    if IRGD_HVP_ENABLED:
+        conflict = first_order_conflict and hvp_harmful
+    else:
+        conflict = first_order_conflict
 
     if conflict:
-
-
         coeff = dot / self_norm_sq.clamp_min(IRGD_EPS)
     else:
         coeff = torch.zeros((), device=DEVICE)
 
     optimizer.zero_grad(set_to_none=True)
 
-    for p, gg, gs, gr in zip(params, grads_graph, grads_self, rel_grads):
+    for p, gg, gs, gr_det in zip(
+        params,
+        grads_graph,
+        grads_self,
+        rel_grads_detached,
+    ):
         if id(p) in encoder_param_ids:
+            gs_det = gs.detach()
             if conflict:
-                gr_safe = gr - coeff * gs
+                gr_safe = gr_det - coeff * gs_det
             else:
-                gr_safe = gr
-            final_grad = gs + IRGD_REL_WEIGHT * gr_safe
+                gr_safe = gr_det
+            final_grad = gs_det + IRGD_REL_WEIGHT * gr_safe
         else:
-
-            final_grad = gg
+            final_grad = gg.detach()
 
         p.grad = final_grad.detach()
 
@@ -554,18 +671,23 @@ def apply_irgd_step(
         'loss_full': float(loss_full.detach().cpu()),
         'ce_full': float(ce_full.detach().cpu()),
         'ce_self': float(ce_self.detach().cpu()),
+        'first_order_conflict': first_order_conflict,
+        'hvp_checked': hvp_checked,
+        'hvp_harmful': hvp_harmful,
         'conflict': conflict,
         'dot': float(dot.detach().cpu()),
         'cosine': float(cosine),
+        'cross_curvature': cross_curvature,
+        'rel_curvature': rel_curvature,
+        'predicted_harm': predicted_harm,
     }
 
-
 def attention_heads_node_mean_from_cached_incoming(
-    ei_used,
-    att_heads,
-    num_nodes,
-    heads,
-    reference_nodes=None,
+        ei_used,
+        att_heads,
+        num_nodes,
+        heads,
+        reference_nodes=None,
 ):
     dst = ei_used[1]
     E = dst.numel()
@@ -594,12 +716,12 @@ def attention_heads_node_mean_from_cached_incoming(
 
 
 def sparse_entropy_loss_sum_heads(
-    ei_used,
-    att_heads,
-    num_nodes,
-    heads,
-    nodes_mask=None,
-    eps=1e-12,
+        ei_used,
+        att_heads,
+        num_nodes,
+        heads,
+        nodes_mask=None,
+        eps=1e-12,
 ):
     dst = ei_used[1]
     E = dst.numel()
@@ -636,11 +758,11 @@ def sparse_entropy_loss_sum_heads(
     return norm_entropy.mean()
 
 
+
 for start in tqdm(range(0, N, BATCH_SIZE), desc='Processing batches'):
     batch_feats = features[start:start + BATCH_SIZE]
     batch_labels = labels[start:start + BATCH_SIZE]
     bsz = len(batch_feats)
-
 
     for i in range(bsz):
         features_window.append(batch_feats[i])
@@ -654,14 +776,15 @@ for start in tqdm(range(0, N, BATCH_SIZE), desc='Processing batches'):
     first_window = (model is None)
 
     window_irgd_steps = 0
+    window_first_order_conflicts = 0
+    window_hvp_checks = 0
+    window_hvp_harmful = 0
     window_irgd_conflicts = 0
     window_irgd_cosines = []
-
-
+    window_predicted_harms = []
     x_win_np = np.asarray(features_window, dtype=np.float64)
     y_win_np = np.asarray(labels_window, dtype=np.int64)
     idx_win_np = np.asarray(index_window, dtype=np.int64)
-
 
     new_mask_full = np.zeros(WINDOW_SIZE, dtype=bool)
     if first_window:
@@ -672,10 +795,8 @@ for start in tqdm(range(0, N, BATCH_SIZE), desc='Processing batches'):
     train_mask_full = is_train[idx_win_np]
     test_mask_full = is_test[idx_win_np]
 
-
     x_train_np = x_win_np[train_mask_full]
     y_train_np = y_win_np[train_mask_full]
-
 
     new_train_mask_local_np = new_mask_full[train_mask_full]
 
@@ -689,7 +810,6 @@ for start in tqdm(range(0, N, BATCH_SIZE), desc='Processing batches'):
         dtype=torch.bool,
         device=DEVICE,
     )
-
 
     train_edge_index = build_train_graph(x_train_np)
 
@@ -721,13 +841,10 @@ for start in tqdm(range(0, N, BATCH_SIZE), desc='Processing batches'):
     else:
         epochs_now = GAT_EPOCHS_INC
 
-
     self_edge_index = build_self_only_graph(x_train_tensor.size(0))
-
 
     for _ in range(epochs_now):
         model.train()
-
 
         used_idx = select_training_indices(
             x_train_tensor.size(0),
@@ -751,12 +868,28 @@ for start in tqdm(range(0, N, BATCH_SIZE), desc='Processing batches'):
             )
             if stats is not None:
                 irgd_steps += 1
+                irgd_first_order_conflicts += int(stats['first_order_conflict'])
+                irgd_hvp_checks += int(stats['hvp_checked'])
+                irgd_hvp_harmful += int(stats['hvp_harmful'])
                 irgd_conflicts += int(stats['conflict'])
                 irgd_cosines.append(stats['cosine'])
 
+                if np.isfinite(stats['predicted_harm']):
+                    irgd_predicted_harms.append(stats['predicted_harm'])
+                if np.isfinite(stats['cross_curvature']):
+                    irgd_cross_curvatures.append(stats['cross_curvature'])
+                if np.isfinite(stats['rel_curvature']):
+                    irgd_rel_curvatures.append(stats['rel_curvature'])
+
                 window_irgd_steps += 1
+                window_first_order_conflicts += int(stats['first_order_conflict'])
+                window_hvp_checks += int(stats['hvp_checked'])
+                window_hvp_harmful += int(stats['hvp_harmful'])
                 window_irgd_conflicts += int(stats['conflict'])
                 window_irgd_cosines.append(stats['cosine'])
+
+                if np.isfinite(stats['predicted_harm']):
+                    window_predicted_harms.append(stats['predicted_harm'])
         else:
 
             logits_train, _hidden_train = model(x_train_tensor, train_edge_index)
@@ -788,7 +921,6 @@ for start in tqdm(range(0, N, BATCH_SIZE), desc='Processing batches'):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), IRGD_GRAD_CLIP)
             optimizer.step()
 
-
     if first_window:
         eval_test_mask_full = test_mask_full
     else:
@@ -797,7 +929,6 @@ for start in tqdm(range(0, N, BATCH_SIZE), desc='Processing batches'):
     if eval_test_mask_full.any():
         x_new_test_np = x_win_np[eval_test_mask_full]
         y_new_test_np = y_win_np[eval_test_mask_full]
-
 
         x_eval_tensor, eval_edge_index = build_inductive_eval_graph(
             x_train_np,
@@ -833,7 +964,6 @@ for start in tqdm(range(0, N, BATCH_SIZE), desc='Processing batches'):
             y_prob_test_all.append(probs_test.cpu().numpy())
             hidden_test.extend(mixed12_test.cpu().numpy().tolist())
 
-
     if ENABLE_WINDOW_ANALYSIS and test_mask_full.any():
         x_window_test_np = x_win_np[test_mask_full]
         y_window_test_np = y_win_np[test_mask_full]
@@ -865,62 +995,135 @@ for start in tqdm(range(0, N, BATCH_SIZE), desc='Processing batches'):
             'stream_start': int(idx_win_np[0]),
             'stream_end': int(idx_win_np[-1]),
             'n_test': int(len(y_window_test_np)),
-            'accuracy': float(accuracy_score(
-                y_window_test_np,
-                window_pred_full,
-            )),
-            'precision': float(precision_score(
-                y_window_test_np,
-                window_pred_full,
-                average=WINDOW_METRIC_AVERAGE,
-                zero_division=0,
-            )),
-            'recall': float(recall_score(
-                y_window_test_np,
-                window_pred_full,
-                average=WINDOW_METRIC_AVERAGE,
-                zero_division=0,
-            )),
-            'f1': float(f1_score(
-                y_window_test_np,
-                window_pred_full,
-                average=WINDOW_METRIC_AVERAGE,
-                zero_division=0,
-            )),
+            'accuracy': float(
+                accuracy_score(
+                    y_window_test_np,
+                    window_pred_full,
+                )
+            ),
+            'precision': float(
+                precision_score(
+                    y_window_test_np,
+                    window_pred_full,
+                    average=WINDOW_METRIC_AVERAGE,
+                    zero_division=0,
+                )
+            ),
+            'recall': float(
+                recall_score(
+                    y_window_test_np,
+                    window_pred_full,
+                    average=WINDOW_METRIC_AVERAGE,
+                    zero_division=0,
+                )
+            ),
+            'f1': float(
+                f1_score(
+                    y_window_test_np,
+                    window_pred_full,
+                    average=WINDOW_METRIC_AVERAGE,
+                    zero_division=0,
+                )
+            ),
         })
 
     if ENABLE_WINDOW_ANALYSIS:
         if window_irgd_steps > 0:
+            first_order_ratio = window_first_order_conflicts / window_irgd_steps
             conflict_ratio = window_irgd_conflicts / window_irgd_steps
             mean_window_cos = float(np.mean(window_irgd_cosines))
         else:
+            first_order_ratio = np.nan
             conflict_ratio = np.nan
             mean_window_cos = np.nan
+
+        mean_predicted_harm = (
+            float(np.mean(window_predicted_harms))
+            if len(window_predicted_harms) > 0
+            else np.nan
+        )
 
         window_conflict_stats.append({
             'window': stream_window_id,
             'stream_start': int(idx_win_np[0]),
             'stream_end': int(idx_win_np[-1]),
             'rgc_updates': int(window_irgd_steps),
+            'first_order_conflict_updates': int(window_first_order_conflicts),
+            'hvp_checks': int(window_hvp_checks),
+            'hvp_harmful_updates': int(window_hvp_harmful),
             'conflict_updates': int(window_irgd_conflicts),
-            'conflict_ratio': float(conflict_ratio) if np.isfinite(conflict_ratio) else np.nan,
-            'mean_cosine': float(mean_window_cos) if np.isfinite(mean_window_cos) else np.nan,
+            'first_order_conflict_ratio': (
+                float(first_order_ratio) if np.isfinite(first_order_ratio) else np.nan
+            ),
+            'conflict_ratio': (
+                float(conflict_ratio) if np.isfinite(conflict_ratio) else np.nan
+            ),
+            'mean_cosine': (
+                float(mean_window_cos) if np.isfinite(mean_window_cos) else np.nan
+            ),
+            'mean_predicted_harm': (
+                float(mean_predicted_harm) if np.isfinite(mean_predicted_harm) else np.nan
+            ),
         })
-
     stream_window_id += 1
     model.cached_att = None
 
 
 if IRGD_ENABLED:
-    print("\n=== IRGD Training Diagnostics ===")
-    print(f"IRGD update steps: {irgd_steps}")
+    print("\n=== RGC + HVP Training Diagnostics ===")
+    print(f"RGC update steps: {irgd_steps}")
     if irgd_steps > 0:
-        conflict_rate = 100.0 * irgd_conflicts / irgd_steps
+        first_order_rate = 100.0 * irgd_first_order_conflicts / irgd_steps
+        final_conflict_rate = 100.0 * irgd_conflicts / irgd_steps
         mean_cos = float(np.mean(irgd_cosines)) if irgd_cosines else 0.0
-        print(f"Conflict steps: {irgd_conflicts} ({conflict_rate:.2f}%)")
-        print(f"Mean cosine(g_self, g_rel): {mean_cos:.4f}")
-        print("No-conflict steps are mathematically identical to baseline full-graph updates when IRGD_REL_WEIGHT=1.0.")
 
+        print(
+            f"First-order candidate conflicts: "
+            f"{irgd_first_order_conflicts} ({first_order_rate:.2f}%)"
+        )
+
+        if IRGD_HVP_ENABLED:
+            print(f"HVP checks: {irgd_hvp_checks}")
+            print(f"HVP-confirmed harmful candidates: {irgd_hvp_harmful}")
+            print(
+                f"Final corrected steps: "
+                f"{irgd_conflicts} ({final_conflict_rate:.2f}%)"
+            )
+
+            if irgd_hvp_checks > 0:
+                filtered = irgd_hvp_checks - irgd_hvp_harmful
+                filtered_pct = 100.0 * filtered / irgd_hvp_checks
+                print(
+                    f"First-order candidates rejected by HVP: "
+                    f"{filtered} ({filtered_pct:.2f}%)"
+                )
+
+            if irgd_predicted_harms:
+                print(
+                    "Mean second-order predicted relational harm "
+                    f"(checked steps): {np.mean(irgd_predicted_harms):.6e}"
+                )
+            if irgd_cross_curvatures:
+                print(
+                    "Mean g_self^T H_self g_rel "
+                    f"(checked steps): {np.mean(irgd_cross_curvatures):.6e}"
+                )
+            if irgd_rel_curvatures:
+                print(
+                    "Mean g_rel^T H_self g_rel "
+                    f"(checked steps): {np.mean(irgd_rel_curvatures):.6e}"
+                )
+        else:
+            print(
+                f"Final corrected steps (first-order only): "
+                f"{irgd_conflicts} ({final_conflict_rate:.2f}%)"
+            )
+
+        print(f"Mean cosine(g_self, g_rel): {mean_cos:.4f}")
+        print(
+            "Steps not finally confirmed harmful are mathematically identical "
+            "to baseline full-graph updates when IRGD_REL_WEIGHT=1.0."
+        )
 
 y_true_test = np.asarray(y_true_test, dtype=np.int64)
 y_pred_test = np.asarray(y_pred_test, dtype=np.int64)
@@ -929,6 +1132,7 @@ if len(y_prob_test_all) > 0:
     y_prob_test_all = np.vstack(y_prob_test_all)
 else:
     y_prob_test_all = np.empty((0, NUM_CLASSES), dtype=np.float64)
+
 
 print("\n=== Evaluation on Random Test Split (15%) ===")
 print(f"Expected hold-out samples: {len(test_idx)}")
@@ -968,22 +1172,16 @@ else:
             f"f1-score: {m['f1-score'] * 100:.2f}%"
         )
 
-
     try:
         labels_order = unique_ids.tolist()
-
-
         display_names = []
 
         for i in labels_order:
             name = id_to_label[i]
-
             if name == 'C&C-HeartBeat':
                 name = 'C&C-\nHeartBeat'
-
             elif name == 'PartOfAHorizontalPortScan':
                 name = 'PartOfAHorizontal\nPortScan'
-
             display_names.append(name)
 
         cm = confusion_matrix(
@@ -998,17 +1196,14 @@ else:
         )
 
         fig_cm, ax_cm = plt.subplots(figsize=(6.2, 5.5))
-
         disp.plot(
             values_format='d',
             cmap='Blues',
             colorbar=False,
             ax=ax_cm
         )
-
         ax_cm.set_xlabel('Predicted label')
         ax_cm.set_ylabel('True label')
-
 
         plt.setp(
             ax_cm.get_xticklabels(),
@@ -1024,7 +1219,6 @@ else:
     except Exception as e:
         print("Error while plotting the confusion matrix:", e)
 
-
     try:
         print("\n=== ROC Diagnostics ===")
         print("NUM_CLASSES:", NUM_CLASSES)
@@ -1034,112 +1228,76 @@ else:
 
         if len(y_true_test) == 0:
             print("[ROC] The test set is empty. ROC cannot be plotted.")
-
         elif y_prob_test_all.shape[0] != len(y_true_test):
             print(
                 f"[ROC] Sample count mismatch: "
                 f"y_true={len(y_true_test)}, "
                 f"y_prob={y_prob_test_all.shape[0]}"
             )
-
         elif y_prob_test_all.shape[1] != NUM_CLASSES:
             print(
                 f"[ROC] Probability matrix class dimension mismatch: "
-                f"expected={NUM_CLASSES}, "
-                f"actual={y_prob_test_all.shape[1]}"
+                f"expected={NUM_CLASSES}, actual={y_prob_test_all.shape[1]}"
             )
-
         else:
             fig_roc, ax_roc = plt.subplots(figsize=(7.2, 5.4))
-
             plotted = False
 
-
             if NUM_CLASSES > 2:
-
                 classes_sorted = np.arange(NUM_CLASSES)
-
                 y_true_bin = label_binarize(
                     y_true_test,
                     classes=classes_sorted
                 )
-
                 print("y_true_bin shape:", y_true_bin.shape)
 
                 for cls_id in classes_sorted:
-
                     y_true_c = y_true_bin[:, cls_id]
                     y_score_c = y_prob_test_all[:, cls_id]
-
                     n_pos = int(np.sum(y_true_c == 1))
                     n_neg = int(np.sum(y_true_c == 0))
-
-                    class_name = id_to_label.get(
-                        int(cls_id),
-                        str(cls_id)
-                    )
+                    class_name = id_to_label.get(int(cls_id), str(cls_id))
 
                     print(
-                        f"[ROC] {class_name}: "
-                        f"positive={n_pos}, negative={n_neg}"
+                        f"[ROC] {class_name}: positive={n_pos}, negative={n_neg}"
                     )
-
 
                     if n_pos == 0 or n_neg == 0:
                         print(
-                            f"[ROC] Skip {class_name}: "
-                            f"missing positive or negative samples."
+                            f"[ROC] Skip {class_name}: missing positive or negative samples."
                         )
                         continue
 
-                    fpr, tpr, _ = roc_curve(
-                        y_true_c,
-                        y_score_c
-                    )
-
+                    fpr, tpr, _ = roc_curve(y_true_c, y_score_c)
                     roc_auc = auc(fpr, tpr)
-
                     ax_roc.plot(
                         fpr,
                         tpr,
                         linewidth=1.5,
                         label=f"{class_name} (AUC={roc_auc:.3f})"
                     )
-
                     plotted = True
 
-
             elif NUM_CLASSES == 2:
-
                 y_true_c = y_true_test
                 y_score_c = y_prob_test_all[:, 1]
 
                 if len(np.unique(y_true_c)) < 2:
                     print(
-                        "[ROC] The binary test set contains only one class, "
-                        "so ROC cannot be computed."
+                        "[ROC] The binary test set contains only one class, so ROC cannot be computed."
                     )
                 else:
-                    fpr, tpr, _ = roc_curve(
-                        y_true_c,
-                        y_score_c
-                    )
-
+                    fpr, tpr, _ = roc_curve(y_true_c, y_score_c)
                     roc_auc = auc(fpr, tpr)
-
                     ax_roc.plot(
                         fpr,
                         tpr,
                         linewidth=1.8,
                         label=f"ROC (AUC={roc_auc:.3f})"
                     )
-
                     plotted = True
 
-
             if plotted:
-
-
                 ax_roc.plot(
                     [0, 1],
                     [0, 1],
@@ -1147,36 +1305,22 @@ else:
                     linewidth=1.0,
                     label='Random'
                 )
-
                 ax_roc.set_xlim([0.0, 1.0])
                 ax_roc.set_ylim([0.0, 1.05])
-
                 ax_roc.set_xlabel('False Positive Rate')
                 ax_roc.set_ylabel('True Positive Rate')
                 ax_roc.set_title('ROC Curves')
-
-                ax_roc.legend(
-                    fontsize=7,
-                    loc='lower right'
-                )
-
-                ax_roc.grid(
-                    alpha=0.25
-                )
-
+                ax_roc.legend(fontsize=7, loc='lower right')
+                ax_roc.grid(alpha=0.25)
                 fig_roc.tight_layout()
                 plt.show()
-
             else:
-                print(
-                    "[ROC] No class satisfies the conditions required for ROC plotting."
-                )
+                print("[ROC] No class satisfies the conditions required for ROC plotting.")
 
             plt.close(fig_roc)
 
     except Exception as e:
         print("Error while computing or plotting ROC:", repr(e))
-
 
 if ENABLE_WINDOW_ANALYSIS:
     if len(window_metrics) > 0:
@@ -1226,60 +1370,96 @@ if ENABLE_WINDOW_ANALYSIS:
             .reset_index(drop=True)
         )
 
-        print("\n=== Window-level RGC Conflict Diagnostics ===")
+        print("\n=== Window-level RGC + HVP Diagnostics ===")
         print(f"Total full windows: {len(conflict_df)}")
         print(f"Windows with RGC updates: {len(valid_conflict_df)}")
 
         if len(valid_conflict_df) > 0:
             total_updates = int(valid_conflict_df['rgc_updates'].sum())
+            total_candidates = int(
+                valid_conflict_df['first_order_conflict_updates'].sum()
+            )
+            total_hvp_checks = int(valid_conflict_df['hvp_checks'].sum())
+            total_hvp_harmful = int(
+                valid_conflict_df['hvp_harmful_updates'].sum()
+            )
             total_conflicts = int(valid_conflict_df['conflict_updates'].sum())
+
+            overall_first_order_ratio = (
+                total_candidates / total_updates if total_updates > 0 else 0.0
+            )
             overall_conflict_ratio = (
                 total_conflicts / total_updates if total_updates > 0 else 0.0
             )
 
             print(f"RGC update steps in plotted windows: {total_updates}")
-            print(f"Conflict update steps: {total_conflicts}")
-            print(f"Overall conflict ratio: {overall_conflict_ratio * 100:.2f}%")
-
-            valid_conflict_df['rolling_conflicts'] = (
-                valid_conflict_df['conflict_updates']
-                .rolling(
-                    window=RGC_ROLLING_WINDOWS,
-                    min_periods=1,
-                )
-                .sum()
+            print(f"First-order candidate conflicts: {total_candidates}")
+            print(f"HVP checks: {total_hvp_checks}")
+            print(f"HVP-confirmed harmful candidates: {total_hvp_harmful}")
+            print(f"Final corrected steps: {total_conflicts}")
+            print(
+                f"Overall first-order candidate ratio: "
+                f"{overall_first_order_ratio * 100:.2f}%"
+            )
+            print(
+                f"Overall final correction ratio: "
+                f"{overall_conflict_ratio * 100:.2f}%"
             )
 
+            valid_conflict_df['rolling_candidate_conflicts'] = (
+                valid_conflict_df['first_order_conflict_updates']
+                .rolling(window=RGC_ROLLING_WINDOWS, min_periods=1)
+                .sum()
+            )
+            valid_conflict_df['rolling_confirmed_conflicts'] = (
+                valid_conflict_df['conflict_updates']
+                .rolling(window=RGC_ROLLING_WINDOWS, min_periods=1)
+                .sum()
+            )
             valid_conflict_df['rolling_updates'] = (
                 valid_conflict_df['rgc_updates']
-                .rolling(
-                    window=RGC_ROLLING_WINDOWS,
-                    min_periods=1,
-                )
+                .rolling(window=RGC_ROLLING_WINDOWS, min_periods=1)
                 .sum()
             )
-
+            valid_conflict_df['rolling_first_order_ratio'] = (
+                valid_conflict_df['rolling_candidate_conflicts']
+                / valid_conflict_df['rolling_updates'].clip(lower=1)
+            )
             valid_conflict_df['rolling_conflict_ratio'] = (
-                valid_conflict_df['rolling_conflicts']
+                valid_conflict_df['rolling_confirmed_conflicts']
                 / valid_conflict_df['rolling_updates'].clip(lower=1)
             )
 
             fig_cr, ax_cr = plt.subplots(figsize=(7.2, 4.6))
             ax_cr.plot(
                 valid_conflict_df['window'],
+                valid_conflict_df['rolling_first_order_ratio'] * 100.0,
+                linewidth=1.4,
+                label=f'{RGC_ROLLING_WINDOWS}-Window First-order Ratio',
+            )
+            ax_cr.plot(
+                valid_conflict_df['window'],
                 valid_conflict_df['rolling_conflict_ratio'] * 100.0,
                 linewidth=1.7,
-                label=f'{RGC_ROLLING_WINDOWS}-Window Rolling Ratio',
+                label=f'{RGC_ROLLING_WINDOWS}-Window HVP-confirmed Ratio',
+            )
+            ax_cr.axhline(
+                overall_first_order_ratio * 100.0,
+                linestyle=':',
+                linewidth=1.0,
+                label='Overall First-order Ratio',
             )
             ax_cr.axhline(
                 overall_conflict_ratio * 100.0,
                 linestyle='--',
                 linewidth=1.2,
-                label='Overall Ratio',
+                label='Overall HVP-confirmed Ratio',
             )
             ax_cr.set_xlabel('Window Index')
             ax_cr.set_ylabel('RGC Conflict Ratio (%)')
-            ax_cr.set_title('RGC Gradient Conflict Ratio over Streaming Windows')
+            ax_cr.set_title(
+                'First-order Candidates vs HVP-confirmed Harm over Streaming Windows'
+            )
             ax_cr.set_ylim(0.0, 101.0)
             ax_cr.grid(True, alpha=0.3)
             ax_cr.legend()
@@ -1288,7 +1468,6 @@ if ENABLE_WINDOW_ANALYSIS:
             plt.close(fig_cr)
         else:
             print("[RGC Conflict] No RGC-enabled window was recorded.")
-
 
 TSNE_MAX_PER_CLASS = 1000
 
@@ -1299,7 +1478,6 @@ try:
 
         print("\n=== t-SNE Diagnostics ===")
         print(f"Raw embedding shape: {hidden_test_np.shape}")
-
 
         finite_mask = np.isfinite(hidden_test_np).all(axis=1)
         if not finite_mask.all():
@@ -1315,18 +1493,17 @@ try:
             dim_std = hidden_test_np.std(axis=0)
             useful_dims = dim_std > 1e-10
             if useful_dims.sum() < 2:
-                print("t-SNE: Fewer than two informative embedding dimensions remain. Reliable visualization is not possible.")
+                print(
+                    "t-SNE: Fewer than two informative embedding dimensions remain. Reliable visualization is not possible.")
             else:
                 if useful_dims.sum() != hidden_test_np.shape[1]:
                     removed = hidden_test_np.shape[1] - int(useful_dims.sum())
                     print(f"[t-SNE] Removed {removed} near-constant dimensions.")
                 x_tsne = hidden_test_np[:, useful_dims]
 
-
                 x_tsne = StandardScaler().fit_transform(x_tsne)
                 x_tsne = np.nan_to_num(x_tsne, nan=0.0, posinf=10.0, neginf=-10.0)
                 x_tsne = np.clip(x_tsne, -10.0, 10.0)
-
 
                 rng = np.random.default_rng(SEED)
                 selected = []
@@ -1368,7 +1545,6 @@ try:
                     f"y=[{emb_2d[:, 1].min():.3f}, {emb_2d[:, 1].max():.3f}]"
                 )
 
-
                 fig_tsne, ax_tsne = plt.subplots(figsize=(7.0, 6.0))
                 for cls_id in np.unique(labels_plot):
                     mask = labels_plot == cls_id
@@ -1391,3 +1567,4 @@ try:
         print("t-SNE: Too few test embeddings. Skipping visualization.")
 except Exception as e:
     print("t-SNE visualization failed:", e)
+
