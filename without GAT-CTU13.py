@@ -221,25 +221,35 @@ def build_inductive_eval_graph(x_train_np: np.ndarray, x_test_np: np.ndarray):
 class GCNClassifier(nn.Module):
     def __init__(self, in_channels, hidden_channels, num_classes=2):
         super().__init__()
+
         self.gcn1 = GCNConv(
             in_channels,
             hidden_channels,
             add_self_loops=False,
         )
+
         self.gcn2 = GCNConv(
             hidden_channels,
             hidden_channels,
             add_self_loops=False,
         )
-        self.classifier = nn.Linear(hidden_channels, num_classes)
+
+        self.classifier = nn.Linear(
+            hidden_channels,
+            num_classes
+        )
 
     def forward(self, x, edge_index):
-        x1 = self.gcn1(x, edge_index)
+        x1 = self.gcn1(
+            x,
+            edge_index
+        )
         x1 = F.elu(x1)
-
-        x2 = self.gcn2(x1, edge_index)
+        x2 = self.gcn2(
+            x1,
+            edge_index
+        )
         logits = self.classifier(x2)
-
         return logits, x2
 
 
@@ -681,7 +691,6 @@ for start in tqdm(range(0, N, BATCH_SIZE), desc='Processing batches'):
         model = GCNClassifier(
             in_channels=x_train_tensor.shape[1],
             hidden_channels=HIDDEN_CHANNELS,
-            heads=ATTN_HEADS,
             num_classes=NUM_CLASSES,
         ).to(DEVICE)
 
