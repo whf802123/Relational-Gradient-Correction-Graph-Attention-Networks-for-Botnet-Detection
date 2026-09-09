@@ -47,7 +47,6 @@ SEED             = 42
 USE_REPLAY       = True
 REPLAY_RATIO     = 0.10
 
-ENTROPY_LAMBDA   = 0.0
 
 ENABLE_WINDOW_ANALYSIS = True
 WINDOW_METRIC_AVERAGE  = 'macro'
@@ -486,27 +485,6 @@ def apply_irgd_step(
     self_edge_index,
     used_idx,
 ):
-    """
-    Two-stage RGC:
-
-    1) First-order candidate conflict:
-         g_rel = g_graph - g_self
-         g_self^T g_rel < 0
-
-    2) HVP harm verification using the self-only CE Hessian:
-
-         Delta_rel^(2)
-           = -eta g_self^T g_rel
-             + eta^2 g_self^T H_self g_rel
-             + 0.5 eta^2 g_rel^T H_self g_rel
-
-       RGC correction is applied only when the first-order candidate exists
-       and Delta_rel^(2) > 0.
-
-    IRGD_HVP_STEP is a local SGD-style Taylor probe scale. The actual
-    optimizer is Adam, so Delta_rel^(2) is a local harm estimate rather than
-    an exact Adam loss prediction.
-    """
     params = [p for p in model.parameters() if p.requires_grad]
     encoder_param_ids = {
         id(p) for p in list(model.gcn1.parameters()) + list(model.gcn2.parameters())
@@ -518,19 +496,7 @@ def apply_irgd_step(
     if ce_full is None:
         return None
 
-    ei_full, att_full = model.cached_att
-    nodes_mask = torch.zeros(
-        x_train_tensor.size(0), dtype=torch.bool, device=DEVICE
-    )
-    nodes_mask[used_idx] = True
-
-    ent_full = sparse_entropy_loss_sum_heads(
-        ei_full,
-        att_full,
-        num_nodes=x_train_tensor.size(0),
-                nodes_mask=nodes_mask,
-    )
-    loss_full = ce_full + ENTROPY_LAMBDA * ent_full
+    loss_full = ce_full
 
     grads_graph_raw = torch.autograd.grad(
         loss_full,
@@ -836,14 +802,7 @@ for start in tqdm(range(0, N, BATCH_SIZE), desc='Processing batches'):
             logits_eval, hidden8_eval = model(x_eval_tensor, eval_edge_index)
             probs_eval = torch.softmax(logits_eval, dim=1)
 
-            ei_used, att_heads = model.cached_att
-            head4_eval = attention_heads_node_mean_from_cached_incoming(
-                ei_used,
-                att_heads,
-                num_nodes=x_eval_tensor.size(0),
-                                reference_nodes=x_train_np.shape[0],
-            )
-            mixed12_eval = torch.cat([hidden8_eval, head4_eval], dim=1)
+            mixed12_eval = hidden8_eval
 
             n_train_ctx = x_train_np.shape[0]
             test_slice = slice(n_train_ctx, n_train_ctx + len(x_new_test_np))
